@@ -214,3 +214,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Données locales — trop lourdes et partiellement propriétaires
+data/raw/
+data/processed/
