@@ -15,7 +15,9 @@ import yfinance as yf
 from pathlib import Path
 
 
-_SECTOR_CACHE = Path("data/raw/sectors.json")
+_SECTOR_CACHE  = Path("data/raw/sectors.json")
+_MCAP_CACHE    = Path("data/raw/market_caps.json")
+_MCAP_TTL_DAYS = 30   # market caps changent lentement
 
 GICS_SECTORS = [
     "Communication Services", "Consumer Discretionary", "Consumer Staples",
@@ -58,6 +60,55 @@ def load_sector_map(tickers: list[str], force: bool = False) -> dict[str, str]:
     _SECTOR_CACHE.parent.mkdir(parents=True, exist_ok=True)
     _SECTOR_CACHE.write_text(json.dumps(sector_map))
     return {t: sector_map.get(t, "Unknown") for t in tickers}
+
+
+# ---------------------------------------------------------------------------
+# Market cap weights (prior BL)
+# ---------------------------------------------------------------------------
+
+def load_market_cap_weights(
+    tickers: list[str],
+    force: bool = False,
+) -> pd.Series:
+    """
+    Retourne les poids market-cap normalisés pour une liste de tickers.
+    Utilisé comme prior dans Black-Litterman (π = λΣw_mkt).
+    Cache local 30 jours — rafraîchi automatiquement au refresh mensuel.
+    """
+    cached_mcaps: dict[str, float] = {}
+
+    if _MCAP_CACHE.exists() and not force:
+        age_days = (time.time() - _MCAP_CACHE.stat().st_mtime) / 86400
+        if age_days < _MCAP_TTL_DAYS:
+            cached_mcaps = json.loads(_MCAP_CACHE.read_text())
+
+    missing = [t for t in tickers if t not in cached_mcaps]
+
+    if missing:
+        print(f"  Fetch market caps pour {len(missing)} tickers...")
+        for i, ticker in enumerate(missing):
+            try:
+                info = yf.Ticker(ticker).info
+                mcap = info.get("marketCap") or 0
+                cached_mcaps[ticker] = float(mcap)
+            except Exception:
+                cached_mcaps[ticker] = 0.0
+            if i % 50 == 0 and i > 0:
+                print(f"    [{i}/{len(missing)}]")
+            time.sleep(0.05)
+
+        _MCAP_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        _MCAP_CACHE.write_text(json.dumps(cached_mcaps))
+
+    mcaps = pd.Series({t: cached_mcaps.get(t, 0.0) for t in tickers})
+
+    # Fallback equal-weight pour les tickers sans market cap
+    n_missing = (mcaps == 0).sum()
+    if n_missing > 0:
+        avg = mcaps[mcaps > 0].mean()
+        mcaps[mcaps == 0] = avg if avg > 0 else 1.0
+
+    return mcaps / mcaps.sum()
 
 
 # ---------------------------------------------------------------------------

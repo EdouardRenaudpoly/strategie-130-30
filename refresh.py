@@ -190,6 +190,20 @@ if not skip_fundamentals:
             print(f"  {name} : OK {df.shape}")
         else:
             print(f"  {name} : aucune donnée")
+
+    print("Signal SUE — Standardized Unexpected Earnings (EDGAR XBRL)...")
+    from src.signals.sue import compute_sue
+    sue_df = compute_sue(
+        tickers=prices.columns.tolist(),
+        cik_map=cik_map,
+        start_year=2013,
+        verbose=True,
+    )
+    if not sue_df.empty:
+        sue_df.to_csv("data/processed/signals/sue.csv")
+        print(f"  sue : OK {sue_df.shape}")
+    else:
+        print("  sue : aucune donnée")
 else:
     print("Fondamentaux ignorés (--no-fundamentals)")
 

@@ -19,6 +19,16 @@ class BacktestConfig:
     transaction_cost_bps: float = 7  # coûts de transaction en bps
     train_end: str = "2020-01-01"    # frontière train / test
     sector_neutral: bool = True      # neutralisation intra-secteur des signaux
+    use_bl: bool = False             # Black-Litterman pour la construction du portefeuille
+    bl_tau: float = 0.05             # incertitude sur le prior BL
+    bl_confidence: float = 0.5      # confiance dans les vues (0=prior pur, 1=vues pures)
+    use_hmm: bool = False            # pondérer les coefficients Fama-MacBeth par régime HMM
+    hmm_sharpness: float = 2.0       # accentuation de la pondération (1=linéaire, 2=quadratique)
+    long_only: bool = False          # pas de shorts — equal-weight top-N
+    n_positions: int = 10            # nombre de titres longs (utilisé si long_only=True)
+    sector_cap: int = 0              # max titres par secteur (0 = pas de limite)
+    rank_buffer: float = 1.0         # un titre existant est conservé s'il reste dans top n×rank_buffer
+    volatility_sizing: bool = False  # pondérer par 1/vol au lieu de equal-weight
 
 
 @dataclass
@@ -40,6 +50,7 @@ class BacktestEngine:
         config: BacktestConfig | None = None,
         universe_snapshots: "pd.DataFrame | None" = None,
         sector_map: "dict[str, str] | None" = None,
+        mcap_weights: "pd.Series | None" = None,
     ):
         self.returns = returns
         self.volume = volume
@@ -48,6 +59,9 @@ class BacktestEngine:
         self.results = BacktestResults()
         self.universe_snapshots = universe_snapshots
         self.sector_map = sector_map
+        self.mcap_weights = mcap_weights
+        # Precompute sector Series for vectorized groupby in _sector_neutralize
+        self._sector_series: pd.Series | None = None
 
         self.monthly_returns = (1 + returns).resample("MS").prod() - 1
         self.monthly_signals = {
@@ -57,8 +71,15 @@ class BacktestEngine:
         self.signals = signals
 
     def run(self) -> BacktestResults:
+        import time as _time
         rebal_dates = self._rebalancing_dates()
         prev_weights = pd.Series(0.0, index=self.returns.columns)
+
+        # Pré-calcul des features de régime (partagées entre toutes les dates)
+        _hmm_features = None
+        if self.config.use_hmm:
+            from src.regime.hmm import build_features
+            _hmm_features = build_features(self.monthly_returns)
 
         portfolio_returns = {}
         portfolio_weights = {}
@@ -66,7 +87,9 @@ class BacktestEngine:
         portfolio_costs = {}
         portfolio_factor_weights = {}
 
-        for t in rebal_dates:
+        n_total = len(rebal_dates)
+        _t0 = _time.time()
+        for _i, t in enumerate(rebal_dates):
             # --- Univers historiquement correct à la date t ---
             if self.universe_snapshots is not None:
                 from src.universe.historical_constituents import get_universe_at_date
@@ -99,8 +122,29 @@ class BacktestEngine:
                 # Pas assez d'historique pour estimer le modèle
                 continue
 
+            # --- Régime HMM (optionnel) ---
+            month_weights = None
+            if self.config.use_hmm and _hmm_features is not None:
+                from src.regime.hmm import RegimeDetector, regime_sample_weights
+                feat_window = _hmm_features[_hmm_features.index < t].iloc[-self.config.estimation_window:]
+                if len(feat_window) >= 12:
+                    try:
+                        import warnings
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            det = RegimeDetector(n_states=2, random_state=42)
+                            det.fit(feat_window)
+                        proba_hist    = det.predict_proba(feat_window)
+                        current_proba = proba_hist.iloc[-1]
+                        month_weights = regime_sample_weights(
+                            proba_hist, current_proba,
+                            sharpness=self.config.hmm_sharpness,
+                        )
+                    except Exception:
+                        month_weights = None
+
             # --- Fama-MacBeth + Ridge ---
-            factor_weights = self._estimate_factor_weights(window_signals, window_returns)
+            factor_weights = self._estimate_factor_weights(window_signals, window_returns, month_weights)
             portfolio_factor_weights[t] = factor_weights
 
             # --- Score alpha au temps t ---
@@ -124,7 +168,8 @@ class BacktestEngine:
             )
             alpha_scores = X_scaled @ factor_weights[common_factors]
 
-            # --- Optimisation 130/30 ---
+            # --- Optimisation ---
+            self._current_t = t
             new_weights = self._optimize(alpha_scores, prev_weights)
             if new_weights is None:
                 continue
@@ -153,6 +198,14 @@ class BacktestEngine:
 
             prev_weights = new_weights
 
+            # Progress log every 20 rebalancings
+            if (_i + 1) % 20 == 0 or (_i + 1) == n_total:
+                elapsed = _time.time() - _t0
+                pct = (_i + 1) / n_total
+                eta = elapsed / pct * (1 - pct)
+                print(f"  [{_i+1}/{n_total}]  {t.date()}  "
+                      f"({pct:.0%})  écoulé {elapsed:.0f}s  ETA {eta:.0f}s")
+
         self.results.returns = pd.Series(portfolio_returns)
         self.results.weights = pd.DataFrame(portfolio_weights).T
         self.results.turnover = pd.Series(portfolio_turnover)
@@ -174,37 +227,47 @@ class BacktestEngine:
 
     def _sector_neutralize(self, X: pd.DataFrame) -> pd.DataFrame:
         """
-        Neutralisation intra-secteur : pour chaque signal, soustrait la moyenne
-        du secteur et divise par l'écart-type du secteur (z-score intra-secteur).
-        Les tickers sans secteur connu sont conservés tels quels.
+        Neutralisation intra-secteur via pandas groupby (vectorisé).
+        Soustrait la moyenne sectorielle et divise par l'écart-type (z-score).
         """
         if self.sector_map is None:
             return X
+
+        # Build sector label Series aligned to X.index (cached across calls)
+        if self._sector_series is None or not X.index.isin(self._sector_series.index).all():
+            self._sector_series = pd.Series(
+                {t: self.sector_map.get(t, "Unknown") for t in self.returns.columns}
+            )
+        sectors = self._sector_series.reindex(X.index)
+
         X = X.copy()
         for col in X.columns:
-            for sector in set(self.sector_map.values()):
-                members = [t for t in X.index if self.sector_map.get(t) == sector]
-                if len(members) < 3:
-                    continue
-                vals = X.loc[members, col].dropna()
-                if len(vals) < 2:
-                    continue
-                std = vals.std()
-                if std > 0:
-                    X.loc[vals.index, col] = (vals - vals.mean()) / std
-                else:
-                    X.loc[vals.index, col] = 0.0
+            vals = X[col]
+            grp = vals.groupby(sectors)
+            counts = grp.transform("count")
+            means  = grp.transform("mean")
+            stds   = grp.transform("std").fillna(0)
+
+            eligible = counts >= 3
+            X.loc[eligible & (stds > 0), col] = (
+                (vals - means) / stds
+            ).loc[eligible & (stds > 0)]
+            X.loc[eligible & (stds == 0), col] = 0.0
         return X
 
     def _estimate_factor_weights(
-        self, window_signals: dict, window_returns: pd.DataFrame
+        self,
+        window_signals: dict,
+        window_returns: pd.DataFrame,
+        month_weights: pd.Series | None = None,
     ) -> pd.Series:
         """
         Fama-MacBeth : régression cross-sectionelle à chaque mois passé,
-        moyenne des coefficients → poids des facteurs.
+        moyenne (éventuellement pondérée par régime HMM) des coefficients.
         Ridge pour régulariser quand les signaux sont corrélés.
         """
         monthly_coefs = []
+        coef_dates    = []
 
         for date in window_returns.index:
             # Rendement forward (mois suivant cette date dans la fenêtre)
@@ -242,12 +305,22 @@ class BacktestEngine:
             ridge = Ridge(alpha=self.config.ridge_alpha)
             ridge.fit(X_scaled, y)
             monthly_coefs.append(pd.Series(ridge.coef_, index=X.columns))
+            coef_dates.append(date)
 
         if not monthly_coefs:
             return pd.Series(dtype=float)
 
-        # Moyenne des coefficients mensuels — procédure Fama-MacBeth
-        return pd.DataFrame(monthly_coefs).mean()
+        coef_df = pd.DataFrame(monthly_coefs, index=coef_dates)
+
+        # Moyenne pondérée par régime si HMM activé
+        if month_weights is not None and not month_weights.empty:
+            w = month_weights.reindex(coef_df.index).fillna(month_weights.mean())
+            w = w.clip(lower=0)
+            w_sum = w.sum()
+            if w_sum > 0:
+                return (coef_df.multiply(w, axis=0)).sum() / w_sum
+
+        return coef_df.mean()
 
     def _get_current_signals(
         self, t: pd.Timestamp, valid_tickers: list[str] | None = None
@@ -270,6 +343,92 @@ class BacktestEngine:
         self, alpha_scores: pd.Series, prev_weights: pd.Series
     ) -> pd.Series | None:
         """Délègue à src/optimization — importé ici pour éviter circularité."""
+        if self.config.long_only:
+            n           = self.config.n_positions
+            sector_cap  = self.config.sector_cap
+            rank_buffer = self.config.rank_buffer
+
+            ranked       = alpha_scores.sort_values(ascending=False)
+            buffer_size  = int(n * rank_buffer)
+            top_buffer   = set(ranked.head(buffer_size).index)
+
+            # Conserver les positions existantes encore dans le buffer de rang
+            existing = set(prev_weights[prev_weights > 1e-6].index)
+            retained = existing & top_buffer
+
+            # Décompte sectoriel des positions retenues
+            sec_counts: dict[str, int] = {}
+            if sector_cap > 0 and self.sector_map:
+                for tk in retained:
+                    sec = self.sector_map.get(tk, "Unknown")
+                    sec_counts[sec] = sec_counts.get(sec, 0) + 1
+
+            # Compléter jusqu'à n_positions par alpha décroissant
+            selected = set(retained)
+            for tk in ranked.index:
+                if len(selected) >= n:
+                    break
+                if tk in selected:
+                    continue
+                if sector_cap > 0 and self.sector_map:
+                    sec = self.sector_map.get(tk, "Unknown")
+                    if sec_counts.get(sec, 0) >= sector_cap:
+                        continue
+                    sec_counts[sec] = sec_counts.get(sec, 0) + 1
+                selected.add(tk)
+
+            if not selected:
+                return None
+
+            selected_list = list(selected)
+
+            if self.config.volatility_sizing:
+                # Pondération inverse de la volatilité (risk parity au niveau titre)
+                # Utilise les 12 derniers mois de rendements mensuels disponibles avant t
+                t_cur = getattr(self, "_current_t", None)
+                hist_idx = self.monthly_returns.index < t_cur if t_cur is not None \
+                           else pd.Series([True] * len(self.monthly_returns.index))
+                hist = self.monthly_returns[hist_idx].iloc[-12:]
+                vol = hist[selected_list].std() * np.sqrt(12)
+                vol = vol.replace(0, np.nan).dropna().clip(lower=0.02)
+                if vol.empty:
+                    inv_vol = pd.Series(1.0 / len(selected_list), index=selected_list)
+                else:
+                    inv_vol = 1.0 / vol
+                    # Compléter les titres sans historique de vol avec la médiane
+                    missing = [t for t in selected_list if t not in inv_vol.index]
+                    if missing:
+                        inv_vol = pd.concat([inv_vol,
+                            pd.Series(inv_vol.median(), index=missing)])
+                    inv_vol = inv_vol.reindex(selected_list).fillna(inv_vol.median())
+                raw_w = inv_vol / inv_vol.sum()
+                # Appliquer le plafond max_position et renormaliser
+                cap = self.config.max_position if self.config.max_position < 1.0 else 0.20
+                capped = raw_w.clip(upper=cap)
+                w_vals = capped / capped.sum()
+            else:
+                w_vals = pd.Series(1.0 / len(selected_list), index=selected_list)
+
+            w = pd.Series(0.0, index=alpha_scores.index)
+            w[selected_list] = w_vals.reindex(selected_list).fillna(0)
+            return w
+
+        if self.config.use_bl:
+            from src.optimization.black_litterman import black_litterman_weights
+            mkt_w = self.mcap_weights if self.mcap_weights is not None else self.benchmark_weights
+            return black_litterman_weights(
+                returns_hist=self.monthly_returns,
+                alpha_scores=alpha_scores,
+                market_weights=mkt_w,
+                tau=self.config.bl_tau,
+                risk_aversion=2.5,
+                view_confidence=self.config.bl_confidence,
+                max_position=self.config.max_position,
+                max_short=self.config.max_short,
+                max_turnover=self.config.max_turnover,
+                prev_weights=prev_weights,
+            )
+
         try:
             import cvxpy as cp
 
