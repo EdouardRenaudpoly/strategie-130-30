@@ -5,6 +5,10 @@ Signaux : momentum, low volatility, reversal, illiquidity, high 52w, gross profi
 accruals, asset growth, insider trading.
 Optimisation : Fama-MacBeth + Ridge, neutralisation sectorielle GICS, Black-Litterman optionnel.
 
+```bash
+uv run streamlit run app.py
+```
+
 ---
 
 ## Installation

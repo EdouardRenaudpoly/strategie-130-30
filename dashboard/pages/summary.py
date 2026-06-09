@@ -71,21 +71,29 @@ def _metric_card(label: str, ci: MetricCI, pct: bool = False):
     d = 1 if pct else 3
 
     point_str = f"{ci.point * scale:.{d}f}{suffix}"
-    ci_str    = f"IC 95 % : [{ci.lower * scale:.{d}f}{suffix}, {ci.upper * scale:.{d}f}{suffix}]"
+    lo_str    = f"{ci.lower * scale:.{d}f}{suffix}"
+    hi_str    = f"{ci.upper * scale:.{d}f}{suffix}"
 
     st.markdown(
         f"""
         <div style="
             background: #1e293b;
             border-radius: 10px;
-            padding: 18px 20px 14px;
+            padding: 18px 20px 16px;
             border-left: 3px solid #60a5fa;
         ">
             <div style="color:#94a3b8; font-size:12px; text-transform:uppercase;
-                        letter-spacing:0.08em; margin-bottom:6px;">{label}</div>
+                        letter-spacing:0.08em; margin-bottom:8px;">{label}</div>
             <div style="color:#f1f5f9; font-size:28px; font-weight:700;
-                        line-height:1;">{point_str}</div>
-            <div style="color:#64748b; font-size:11px; margin-top:8px;">{ci_str}</div>
+                        line-height:1; margin-bottom:10px;">{point_str}</div>
+            <div style="color:#cbd5e1; font-size:12px; font-weight:500;">IC 95 %</div>
+            <div style="display:flex; gap:6px; align-items:center; margin-top:4px;">
+                <span style="background:#334155; color:#e2e8f0; font-size:13px;
+                             font-weight:600; padding:3px 8px; border-radius:5px;">{lo_str}</span>
+                <span style="color:#64748b; font-size:11px;">—</span>
+                <span style="background:#334155; color:#e2e8f0; font-size:13px;
+                             font-weight:600; padding:3px 8px; border-radius:5px;">{hi_str}</span>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -297,9 +305,9 @@ fournisseur payant, **entièrement reproductible**.
 
     st.divider()
 
-    # Section 3 — IS vs OOS
-    st.subheader("Performance in-sample vs out-of-sample")
-    _render_is_oos_table(tags)
+    # Section 3 — IS vs OOS (collapsed par défaut)
+    with st.expander("Performance in-sample vs out-of-sample (jan. 2020)"):
+        _render_is_oos_table(tags)
 
     st.divider()
 

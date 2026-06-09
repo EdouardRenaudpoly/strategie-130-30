@@ -2,7 +2,7 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-from dashboard.components import COLORS, explain
+from dashboard.components import explain
 
 
 def render(picks: pd.DataFrame) -> None:
@@ -34,13 +34,27 @@ def render(picks: pd.DataFrame) -> None:
             "score alpha, le secteur et le montant alloué."
         )
         if not longs.empty and longs["weight_pct"].notna().any():
+            # Treemap hiérarchique : secteurs (racines) → tickers (feuilles)
+            lng = longs.copy()
+            lng["sector"] = lng["sector"].fillna("Other")
+            sectors_list  = lng["sector"].unique().tolist()
+            sec_weights   = [lng[lng["sector"] == s]["weight_pct"].fillna(0).sum()
+                             for s in sectors_list]
+
+            all_labels  = sectors_list + lng["ticker"].tolist()
+            all_parents = [""] * len(sectors_list) + lng["sector"].tolist()
+            all_values  = sec_weights + lng["weight_pct"].fillna(0).tolist()
+            all_custom  = [[None, None]] * len(sectors_list) + \
+                          lng[["alpha_score", "amount_cad"]].values.tolist()
+
             fig_tree = go.Figure(go.Treemap(
-                labels=longs["ticker"],
-                parents=longs["sector"].fillna("Other"),
-                values=longs["weight_pct"].fillna(0),
-                customdata=longs[["alpha_score", "amount_cad"]],
+                labels=all_labels,
+                parents=all_parents,
+                values=all_values,
+                branchvalues="total",
+                customdata=all_custom,
                 hovertemplate=(
-                    "<b>%{label}</b><br>Secteur: %{parent}<br>"
+                    "<b>%{label}</b><br>"
                     "Poids: %{value:.1f}%<br>"
                     "Score alpha: %{customdata[0]:.4f}<br>"
                     "Montant: $%{customdata[1]}<extra></extra>"
@@ -49,8 +63,8 @@ def render(picks: pd.DataFrame) -> None:
                 marker=dict(colorscale="Teal"),
             ))
             fig_tree.update_layout(
-                height=400, paper_bgcolor="rgba(0,0,0,0)",
-                title="Allocation du portefeuille long",
+                height=420, paper_bgcolor="rgba(0,0,0,0)",
+                margin=dict(t=10, l=0, r=0, b=0),
             )
             st.plotly_chart(fig_tree, width="stretch")
 

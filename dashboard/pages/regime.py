@@ -110,13 +110,11 @@ def _render_current_regime(proba: pd.DataFrame):
     last = proba.iloc[-1]
     last_date = proba.index[-1]
     state = "Bull" if last["p_bull"] >= 0.5 else "Bear"
-    confidence = max(last["p_bull"], last["p_bear"]) * 100
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
     col1.metric("Régime actuel", state)
-    col2.metric("Confiance", f"{confidence:.1f}%")
-    col3.metric("P(Bull)", f"{last['p_bull']:.1%}")
-    col4.metric("Dernière observation", last_date.strftime("%Y-%m"))
+    col2.metric("P(Bull)", f"{last['p_bull']:.1%}")
+    col3.metric("Dernière observation", last_date.strftime("%Y-%m"))
 
 
 def _render_regime_timeline(proba: pd.DataFrame, bt: dict | None):

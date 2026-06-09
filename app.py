@@ -10,7 +10,10 @@ from dashboard.data import (
     load_ic, load_sectors, load_signals, load_picks, load_returns,
     load_monthly_returns,
 )
-from dashboard.pages import performance, signals_ic, sectors, black_litterman, live_picks, stress, regime, summary
+from dashboard.pages import (
+    performance, signals_ic, sectors, black_litterman,
+    live_picks, stress, regime, summary,
+)
 
 # ---------------------------------------------------------------------------
 # Config globale
@@ -25,34 +28,76 @@ st.set_page_config(
 st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# Chargement des données (mis en cache par Streamlit)
+# Session state (requis par segmented_control)
+# ---------------------------------------------------------------------------
+
+_PAGES = [
+    "Résumé",
+    "Performance",
+    "Signaux & IC",
+    "Secteurs",
+    "Régime",
+    "Stress Tests",
+    "Black-Litterman",
+    "Live Picks",
+]
+
+if "page" not in st.session_state:
+    st.session_state.page = "Résumé"
+
+# ---------------------------------------------------------------------------
+# Navigation horizontale (top bar)
+# ---------------------------------------------------------------------------
+
+page = st.segmented_control(
+    "Navigation",
+    options=_PAGES,
+    key="nav_control",
+    label_visibility="collapsed",
+    default="Résumé",
+)
+
+# Fallback si None (premier chargement edge case)
+if page is None:
+    page = st.session_state.page
+else:
+    st.session_state.page = page
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Données (mises en cache par Streamlit)
 # ---------------------------------------------------------------------------
 
 ic_s, ic_m   = load_ic()
 sec_e, sec_s = load_sectors()
 signals      = load_signals()
 picks        = load_picks()
-raw_returns   = load_returns()
-monthly_ret   = load_monthly_returns()
+raw_returns  = load_returns()
+monthly_ret  = load_monthly_returns()
 
 # ---------------------------------------------------------------------------
-# Sidebar
+# Sidebar — config uniquement
 # ---------------------------------------------------------------------------
 
-st.sidebar.title("Stratégie 130/30")
-st.sidebar.caption("Cross-sectionnel | Multi-signal | S&P 500")
-
-page = st.sidebar.radio("Navigation", [
-    "Résumé",
-    "Performance",
-    "Signaux & IC",
-    "Secteurs",
-    "Black-Litterman",
-    "Stress Tests",
-    "Régime HMM",
-    "Live Picks",
-])
-
+st.sidebar.markdown(
+    """
+    <div style="padding: 12px 0 20px;">
+        <div style="font-size: 1.55rem; font-weight: 800; color: #f1f5f9;
+                    letter-spacing: -0.02em; line-height: 1.1;">
+            Stratégie<br>130/30
+        </div>
+        <div style="height: 2px; margin: 10px 0 8px;
+                    background: linear-gradient(90deg, #00D4AA 0%, transparent 100%);
+                    border-radius: 1px;"></div>
+        <div style="font-size: 0.7rem; color: #64748b;
+                    letter-spacing: 0.07em; text-transform: uppercase;">
+            Cross-sectionnel · Multi-signal · S&P 500
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 st.sidebar.divider()
 
 _CONFIG_LABELS = {
@@ -64,7 +109,7 @@ _CONFIG_LABELS = {
 _configs = [c for c in list_backtest_configs() if c in _CONFIG_LABELS]
 _selected_cfg = (
     st.sidebar.selectbox(
-        "Configuration du backtest",
+        "Configuration",
         options=_configs,
         format_func=lambda x: _CONFIG_LABELS.get(x, x),
     )
@@ -72,13 +117,6 @@ _selected_cfg = (
 )
 
 bt = load_backtest(_selected_cfg)
-
-if bt:
-    m = bt["metrics"]
-    st.sidebar.metric("Sharpe",         f"{float(m['sharpe']):.3f}")
-    st.sidebar.metric("Info Ratio",     f"{float(m['ir']):.3f}")
-    st.sidebar.metric("Rendement ann.", f"{float(m['annual_return']):.1%}")
-    st.sidebar.metric("Max Drawdown",   f"{float(m['max_dd']):.1%}")
 
 # ---------------------------------------------------------------------------
 # Routage
@@ -105,11 +143,8 @@ elif page == "Secteurs":
     else:
         sectors.render(sec_e, sec_s)
 
-elif page == "Black-Litterman":
-    if raw_returns is None:
-        st.warning("Données de rendements non disponibles.")
-    else:
-        black_litterman.render(raw_returns, picks, bt)
+elif page == "Régime":
+    regime.render(bt, monthly_ret)
 
 elif page == "Stress Tests":
     if bt is None:
@@ -117,8 +152,11 @@ elif page == "Stress Tests":
     else:
         stress.render(bt, monthly_ret)
 
-elif page == "Régime HMM":
-    regime.render(bt, monthly_ret)
+elif page == "Black-Litterman":
+    if raw_returns is None:
+        st.warning("Données de rendements non disponibles.")
+    else:
+        black_litterman.render(raw_returns, picks, bt)
 
 elif page == "Live Picks":
     if picks.empty:
